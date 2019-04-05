@@ -7,26 +7,32 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/sirupsen/logrus"
 	"io"
+	"strconv"
+	"sync"
 	"time"
 )
 
 type KafkaListener struct {
-	kc                *kafka.Consumer
-	subscriberCbs     *cache.Cache
-	partitionChannels *cache.Cache
-	ctx               *context.Context
-	cancel            context.CancelFunc
+	kc            *kafka.Consumer
+	subscriptions *cache.Cache
+	manageOffsets bool
+	contextPair
+}
+
+type contextPair struct {
+	ctx    *context.Context
+	cancel context.CancelFunc
 }
 
 type subscription struct {
-	*KafkaListener
+	contextPair
+	KafkaListenerCb
 	kafka.RebalanceCb
+	partitionChannels *cache.Cache
+	wg                sync.WaitGroup
+	manageOffsets     bool
+	kl                *KafkaListener
 }
-
-//type Message struct {
-//	ctx *context.Context
-//	m   *kafka.Message
-//}
 
 type KafkaListenerCb func(record *kafka.Message)
 
@@ -48,27 +54,48 @@ func NewKafkaListener(configMap *kafka.ConfigMap) (*KafkaListener, error) {
 		return nil, err
 	}
 	kl.kc = c
-	kl.subscriberCbs = cache.New(cache.DefaultExpiration, 0)
-	kl.partitionChannels = cache.New(cache.DefaultExpiration, 0)
+	kl.subscriptions = cache.New(cache.DefaultExpiration, 0)
+	if cv, err := configMap.Get("enable.auto.offset.store", true); cv == true || err != nil {
+		kl.manageOffsets = false
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	kl.ctx = &ctx
+	kl.cancel = cancel
 
 	return &kl, nil
 }
 
 func (kl *KafkaListener) Close() (err error) {
+	kl.cancel()
+	for _, v := range kl.subscriptions.Items() {
+		if s, ok := v.Object.(subscription); ok {
+			s.wg.Wait()
+		}
+	}
 	return kl.kc.Close()
 }
 
 func (kl *KafkaListener) Subscribe(topic string, listenerCb KafkaListenerCb, rebalanceCb kafka.RebalanceCb) error {
-	return kl.SubscribeTopics([]string{topic}, listenerCb, rebalanceCb)
+	s := subscription{
+		RebalanceCb:       rebalanceCb,
+		KafkaListenerCb:   listenerCb,
+		partitionChannels: cache.New(cache.DefaultExpiration, 0),
+		manageOffsets:     kl.manageOffsets,
+		kl:                kl,
+	}
+	if err := kl.kc.SubscribeTopics([]string{topic}, s.defaultRebalanceCb); err != nil {
+		return err
+	}
+	kl.subscriptions.SetDefault(topic, s)
+	return nil
 }
 
 func (kl *KafkaListener) SubscribeTopics(topics []string, listenerCb KafkaListenerCb, rebalanceCb kafka.RebalanceCb) (err error) {
-	s := subscription{kl, rebalanceCb}
-	if err := kl.kc.SubscribeTopics(topics, s.defaultRebalanceCb); err != nil {
-		return err
-	}
 	for _, t := range topics {
-		kl.subscriberCbs.SetDefault(t, listenerCb)
+		if err := kl.Subscribe(t, listenerCb, rebalanceCb); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -77,17 +104,20 @@ func (kl *KafkaListener) Listen() error {
 	for {
 		msg, err := kl.kc.ReadMessage(-1)
 		if err == nil {
-			key := getPartitionKey(&msg.TopicPartition)
-			v, success := kl.partitionChannels.Get(key)
-			c := v.(chan kafka.Message)
-			if !success {
-				lw.Errorf("No channel found for: %v \n", key)
+			var c chan<- kafka.Message = nil
+			if v, success := kl.subscriptions.Get(*msg.TopicPartition.Topic); success {
+				if s, ok := v.(subscription); ok {
+					if v, success := s.partitionChannels.Get(strconv.FormatInt(int64(msg.TopicPartition.Partition), 10)); success {
+						c = v.(chan kafka.Message)
+					}
+				}
+			}
+			if c == nil {
+				lw.Errorf("No channel found for: %v \n", msg.TopicPartition)
 				continue
 			}
 			select {
 			case c <- *msg:
-				{
-				}
 			case <-time.After(processTime * time.Second):
 				{
 					partitions, err := kl.kc.Assignment()
@@ -112,60 +142,77 @@ func (kl *KafkaListener) Listen() error {
 	}
 }
 
-func (kl *subscription) defaultRebalanceCb(c *kafka.Consumer, ev kafka.Event) error {
+func (s *subscription) defaultRebalanceCb(c *kafka.Consumer, ev kafka.Event) error {
 	switch e := ev.(type) {
 	case kafka.Error:
 		return e
 	case kafka.AssignedPartitions:
 		{
-			if kl.ctx != nil {
-				kl.cancel()
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			kl.ctx = &ctx
-			kl.cancel = cancel
+			ctx, cancel := context.WithCancel(*s.kl.ctx)
+			s.ctx = &ctx
+			s.cancel = cancel
+
+			s.wg.Add(len(e.Partitions))
 			for _, p := range e.Partitions {
-				cb, success := kl.subscriberCbs.Get(*p.Topic)
-				if !success {
-					panic("No Callback found for " + *p.Topic)
-				}
 				partitionChan := make(chan kafka.Message, partitionChannelBuffer)
-				kl.partitionChannels.SetDefault(getPartitionKey(&p), partitionChan)
-				partitionCtx, _ := context.WithCancel(*kl.ctx)
-				go processEvent(&partitionCtx, cb.(KafkaListenerCb), partitionChan)
+				s.partitionChannels.SetDefault(strconv.FormatInt(int64(p.Partition), 10), partitionChan)
+
+				partitionCtx, _ := context.WithCancel(*s.ctx)
+				var kc *kafka.Consumer
+				if s.manageOffsets {
+					kc = s.kl.kc
+				} else {
+					kc = nil
+				}
+				go processEvent(&partitionCtx, partitionChan, kc, s.wg, s.KafkaListenerCb)
 			}
 		}
 	case kafka.RevokedPartitions:
 		{
-			if kl.ctx != nil {
-				kl.cancel()
+			if s.ctx != nil {
+				s.cancel()
+				s.wg.Wait()
 			}
-			ctx, cancel := context.WithCancel(context.Background())
-			kl.ctx = &ctx
-			kl.cancel = cancel
+			s.ctx = nil
+			s.cancel = nil
 			for _, p := range e.Partitions {
-				kl.partitionChannels.Delete(getPartitionKey(&p))
+				s.partitionChannels.Delete(strconv.FormatInt(int64(p.Partition), 10))
 			}
 		}
 	default:
 	}
-	if kl.RebalanceCb != nil  {
-		return kl.RebalanceCb(c, ev)
+	if s.RebalanceCb != nil {
+		return s.RebalanceCb(c, ev)
 	}
 	return nil
 }
 
-func processEvent(ctx *context.Context, cb KafkaListenerCb, c <-chan kafka.Message) {
+func processEvent(ctx *context.Context, mc <-chan kafka.Message, kc *kafka.Consumer, wg sync.WaitGroup, cb KafkaListenerCb) {
+	defer wg.Done()
 	for {
 		select {
 		case <-(*ctx).Done():
 			return
-		case m := <-c:
+		case m := <-mc:
 			cb(&m)
+			if kc != nil {
+				_, err := kc.StoreOffsets([]kafka.TopicPartition{m.TopicPartition})
+				if err != nil {
+					lw.Error(err)
+				}
+			}
 		}
 	}
 }
 
 func getPartitionKey(p *kafka.TopicPartition) string {
 	return fmt.Sprintf("%s:%d", *p.Topic, p.Partition)
+}
+
+func getTopics(partitions *[]kafka.TopicPartition) []string {
+	var topics = make([]string, 5)
+	for _, p := range *partitions {
+		topics = append(topics[:], *p.Topic)
+	}
+	return topics
 }
