@@ -73,6 +73,9 @@ func (kl *KafkaListener) Close() (err error) {
 			s.wg.Wait()
 		}
 	}
+	if _, err := kl.kc.Commit(); err != nil {
+		lw.Error(err)
+	}
 	return kl.kc.Close()
 }
 
