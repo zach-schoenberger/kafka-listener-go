@@ -34,7 +34,7 @@ type subscription struct {
 	kl                *KafkaListener
 }
 
-type KafkaListenerCb func(record *kafka.Message)
+type KafkaListenerCb func(ctx *context.Context, record *kafka.Message)
 
 var partitionChannelBuffer uint64 = 100
 var processTime time.Duration = 10
@@ -197,7 +197,8 @@ func processEvent(ctx *context.Context, mc <-chan kafka.Message, kc *kafka.Consu
 		case <-(*ctx).Done():
 			return
 		case m := <-mc:
-			cb(&m)
+			ctx, _ := context.WithCancel(*ctx)
+			cb(&ctx, &m)
 			if kc != nil {
 				_, err := kc.StoreOffsets([]kafka.TopicPartition{m.TopicPartition})
 				if err != nil {
