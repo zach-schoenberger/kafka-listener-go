@@ -20,7 +20,7 @@ type KafkaListener struct {
 }
 
 type contextPair struct {
-	ctx    *context.Context
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -34,7 +34,7 @@ type subscription struct {
 	kl                *KafkaListener
 }
 
-type KafkaListenerCb func(ctx *context.Context, record *kafka.Message)
+type KafkaListenerCb func(ctx context.Context, record *kafka.Message)
 
 var partitionChannelBuffer uint64 = 100
 var processTime time.Duration = 10
@@ -60,7 +60,7 @@ func NewKafkaListener(configMap *kafka.ConfigMap) (*KafkaListener, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	kl.ctx = &ctx
+	kl.ctx = ctx
 	kl.cancel = cancel
 
 	return &kl, nil
@@ -151,8 +151,8 @@ func (s *subscription) defaultRebalanceCb(c *kafka.Consumer, ev kafka.Event) err
 		return e
 	case kafka.AssignedPartitions:
 		{
-			ctx, cancel := context.WithCancel(*s.kl.ctx)
-			s.ctx = &ctx
+			ctx, cancel := context.WithCancel(s.kl.ctx)
+			s.ctx = ctx
 			s.cancel = cancel
 
 			s.wg.Add(len(e.Partitions))
@@ -160,14 +160,14 @@ func (s *subscription) defaultRebalanceCb(c *kafka.Consumer, ev kafka.Event) err
 				partitionChan := make(chan kafka.Message, partitionChannelBuffer)
 				s.partitionChannels.SetDefault(strconv.FormatInt(int64(p.Partition), 10), partitionChan)
 
-				partitionCtx, _ := context.WithCancel(*s.ctx)
+				partitionCtx, _ := context.WithCancel(s.ctx)
 				var kc *kafka.Consumer
 				if s.manageOffsets {
 					kc = s.kl.kc
 				} else {
 					kc = nil
 				}
-				go processEvent(&partitionCtx, partitionChan, kc, s.wg, s.KafkaListenerCb)
+				go processEvent(partitionCtx, partitionChan, kc, s.wg, s.KafkaListenerCb)
 			}
 		}
 	case kafka.RevokedPartitions:
@@ -190,15 +190,15 @@ func (s *subscription) defaultRebalanceCb(c *kafka.Consumer, ev kafka.Event) err
 	return nil
 }
 
-func processEvent(ctx *context.Context, mc <-chan kafka.Message, kc *kafka.Consumer, wg sync.WaitGroup, cb KafkaListenerCb) {
+func processEvent(ctx context.Context, mc <-chan kafka.Message, kc *kafka.Consumer, wg sync.WaitGroup, cb KafkaListenerCb) {
 	defer wg.Done()
+	msgCtx, _ := context.WithCancel(ctx)
 	for {
 		select {
-		case <-(*ctx).Done():
+		case <-ctx.Done():
 			return
 		case m := <-mc:
-			ctx, _ := context.WithCancel(*ctx)
-			cb(&ctx, &m)
+			cb(msgCtx, &m)
 			if kc != nil {
 				_, err := kc.StoreOffsets([]kafka.TopicPartition{m.TopicPartition})
 				if err != nil {
