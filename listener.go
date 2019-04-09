@@ -7,8 +7,11 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/sirupsen/logrus"
 	"io"
+	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -57,6 +60,8 @@ func NewKafkaListener(configMap *kafka.ConfigMap) (*KafkaListener, error) {
 	kl.subscriptions = cache.New(cache.DefaultExpiration, 0)
 	if cv, err := configMap.Get("enable.auto.offset.store", true); cv == true || err != nil {
 		kl.manageOffsets = false
+	} else {
+		kl.manageOffsets = true
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -74,7 +79,7 @@ func (kl *KafkaListener) Close() (err error) {
 		}
 	}
 	if _, err := kl.kc.Commit(); err != nil {
-		lw.Error(err)
+		lw.Warn(err)
 	}
 	return kl.kc.Close()
 }
@@ -137,6 +142,8 @@ func (kl *KafkaListener) Listen() error {
 						return err
 					}
 				}
+			case <-kl.ctx.Done():
+				return nil
 			}
 		} else {
 			// The client will automatically try to recover from all errors.
@@ -207,6 +214,17 @@ func processEvent(ctx context.Context, mc <-chan kafka.Message, kc *kafka.Consum
 			}
 		}
 	}
+}
+
+func (kl *KafkaListener) HandleSignals() {
+	osSignals := make(chan os.Signal, 1)
+	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for sig := range osSignals {
+			lw.Infof("KafkaListener: Shutting down: %v", sig)
+			kl.cancel()
+		}
+	}()
 }
 
 func getPartitionKey(p *kafka.TopicPartition) string {
