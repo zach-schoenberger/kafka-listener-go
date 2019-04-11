@@ -1,4 +1,4 @@
-module kafka-listener-go
+module github.com/zach-schoenberger/kafka-listener-go
 
 require (
 	github.com/confluentinc/confluent-kafka-go v1.0.0
